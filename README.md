@@ -4,8 +4,8 @@
 > the 320x480 touch screen, the microSD slot and the battery reading. Branch `main` is the unmodified upstream source;
 > `ws-c5-35` is the port.
 >
-> Run on one board: screen, touch, card mount, and the link to Wardrive Go on iPhone. Not tested: the battery reading,
-> and saving a run to the card (the board's GPS is not read yet). Build with ESP-IDF `release/v5.5`.
+> Run on one board: screen, touch, battery reading, card mount, and the link to Wardrive Go on iPhone, alerts included.
+> Not there yet: saving a run to the card (the board's GPS is not read yet). Build with ESP-IDF `release/v5.5`.
 
 ESP32 firmware that turns a small board into a Wi-Fi and Bluetooth scanner for the Wardrive Go app on iOS and
 Android. The board links to the app over Bluetooth and streams everything it hears. No pairing, no setup.
