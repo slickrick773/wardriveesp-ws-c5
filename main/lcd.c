@@ -537,10 +537,38 @@ static bool ws35_i2c_pulled_up(void) {
                          .pull_down_en = GPIO_PULLDOWN_ENABLE };
     gpio_config(&io);
     esp_rom_delay_us(50);
-    bool up = gpio_get_level(WS35_SDA) && gpio_get_level(WS35_SCL);
+    bool sda = gpio_get_level(WS35_SDA), scl = gpio_get_level(WS35_SCL);
+#if CONFIG_IDF_TARGET_ESP32C5
+    // The C5 3.5 after a chip reset that cut a read short (the touch chip is read 40 times a second): the chip on the
+    // bus still holds SDA low, waiting for the clocks of the byte it was sending, and stays that way across resets
+    // (bench 2026-11-21: 25 of 60 resets came up with SDA low and no screen). Clock held high by its pull-up and
+    // data low is that state: SCL is pulsed low (open drain, never driven high) until SDA comes back, then a stop.
+    // This is the one case where a pin is clocked before the board is known: pin 26, only while it reads pulled up
+    // and 27 reads low.
+    if (scl && !sda) {
+        int n = 0;
+        gpio_set_level(WS35_SCL, 1);
+        gpio_set_direction(WS35_SCL, GPIO_MODE_INPUT_OUTPUT_OD);
+        for (; n < 27 && !gpio_get_level(WS35_SDA); n++) {
+            gpio_set_level(WS35_SCL, 0); esp_rom_delay_us(5);
+            gpio_set_level(WS35_SCL, 1); esp_rom_delay_us(5);
+        }
+        if (gpio_get_level(WS35_SDA)) {   // a stop: SDA low, then released, while SCL stays high
+            gpio_set_level(WS35_SDA, 1);
+            gpio_set_direction(WS35_SDA, GPIO_MODE_INPUT_OUTPUT_OD);
+            gpio_set_level(WS35_SDA, 0); esp_rom_delay_us(5);
+            gpio_set_level(WS35_SDA, 1); esp_rom_delay_us(5);
+            gpio_set_direction(WS35_SDA, GPIO_MODE_INPUT);
+        }
+        gpio_set_direction(WS35_SCL, GPIO_MODE_INPUT);
+        esp_rom_delay_us(50);
+        sda = gpio_get_level(WS35_SDA); scl = gpio_get_level(WS35_SCL);
+        ESP_LOGW(TAG, "ws35 probe: SDA was held low, %d clocks on SCL -> SDA %d", n, sda);
+    }
+#endif
     gpio_reset_pin(WS35_SDA);
     gpio_reset_pin(WS35_SCL);
-    return up;
+    return sda && scl;
 }
 
 // ── touch: tap (dismiss an alert), swipe left / right (pages), hold (stealth on / off) ──
