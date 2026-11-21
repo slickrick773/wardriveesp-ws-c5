@@ -57,6 +57,15 @@ bool lcd_probe_waveshare(bool stored);
 bool lcd_probe_ws35(void);
 /// The 3.5-inch boards' battery through their AXP2101: false when no battery is connected (or on any other board).
 bool lcd_battery(int *pct, int *mv);
+/// The C5 3.5's GPS: an LC76G on the board's I2C bus, not a UART. True when the module answers there (it is an
+/// add-on, so a board may have none).
+bool lcd_gps_present(void);
+/// Every address that answers on the C5 3.5's I2C bus, as " 18 24 34 ..." ("" on any other board): for the log.
+void lcd_i2c_scan(char *out, size_t cap);
+/// The NMEA text the module has waiting: the bytes put in `buf` (0 = none right now), or -1 when it didn't answer.
+int lcd_gps_read(uint8_t *buf, size_t cap);
+/// The module stops sending after a while with nothing asked of it: this starts it again. True when it took it.
+bool lcd_gps_wake(void);
 /// What a touch on the screen asks for (touch boards only); the firmware acts on it so the LED and the saved
 /// settings follow too.
 typedef enum { LCD_TOUCH_DISMISS, LCD_TOUCH_STEALTH } lcd_touch_ev_t;

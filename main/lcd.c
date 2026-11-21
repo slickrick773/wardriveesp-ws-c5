@@ -519,6 +519,12 @@ static i2c_master_dev_handle_t s_ft, s_axp, s_tca;
 static i2c_master_dev_handle_t s_ft, s_axp, s_exio;
 #endif
 
+// C5 3.5: the GPS's read is several transfers in a row that nothing else on the bus may cut into, so every user of
+// the bus takes this around its own transfers. Never created on the S3 board (no GPS there): both calls pass through.
+static SemaphoreHandle_t s_i2c_lock;
+static bool i2c_take(uint32_t ms) { return !s_i2c_lock || xSemaphoreTake(s_i2c_lock, pdMS_TO_TICKS(ms)) == pdTRUE; }
+static void i2c_give(void) { if (s_i2c_lock) xSemaphoreGive(s_i2c_lock); }
+
 static esp_err_t i2c_rd(i2c_master_dev_handle_t d, uint8_t reg, uint8_t *out, size_t n) {
     return i2c_master_transmit_receive(d, &reg, 1, out, n, 30);
 }
@@ -581,7 +587,10 @@ static void touch_task(void *arg) {
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(25));
         uint8_t t[5];
-        if (i2c_rd(s_ft, 0x02, t, 5) != ESP_OK) continue;
+        if (!i2c_take(0)) continue;   // the GPS has the bus: this look is skipped
+        esp_err_t te = i2c_rd(s_ft, 0x02, t, 5);
+        i2c_give();
+        if (te != ESP_OK) continue;
         int n = t[0] & 0x0F;
         uint32_t now = now_ms();
         if (n >= 1 && n <= 2) {
@@ -658,6 +667,7 @@ bool lcd_probe_ws35(void) {
     i2c_master_bus_config_t bc = { .i2c_port = -1, .sda_io_num = WS35_SDA, .scl_io_num = WS35_SCL,
                                    .clk_source = I2C_CLK_SRC_DEFAULT, .glitch_ignore_cnt = 7 };
     if (i2c_new_master_bus(&bc, &s_i2c) != ESP_OK) return false;
+    if (!s_i2c_lock) s_i2c_lock = xSemaphoreCreateMutex();
     uint8_t ft = 0, axp = 0;
     bool has_exio = i2c_master_probe(s_i2c, EXIO_ADDR, 30) == ESP_OK, has_axp = i2c_master_probe(s_i2c, AXP2101_ADDR, 30) == ESP_OK;
     if (has_axp) { s_axp = i2c_dev(AXP2101_ADDR); if (!s_axp || i2c_rd(s_axp, 0x03, &axp, 1) != ESP_OK) axp = 0; }
@@ -760,15 +770,149 @@ bool lcd_probe_ws35(void) {
 
 bool lcd_battery(int *pct, int *mv) {
 #if CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32C5
-    if (!s_axp) return false;
+    if (!s_axp || !i2c_take(300)) return false;
     uint8_t st = 0, p = 0, v[2] = {0};
-    if (i2c_rd(s_axp, 0x00, &st, 1) != ESP_OK || !(st & 0x08)) return false;   // status 1, bit 3: a battery is there
-    if (i2c_rd(s_axp, 0xA4, &p, 1) != ESP_OK) return false;                      // fuel gauge, percent
-    if (pct) *pct = p > 100 ? 100 : p;
-    if (mv && i2c_rd(s_axp, 0x34, v, 2) == ESP_OK) *mv = ((v[0] & 0x3F) << 8) | v[1];   // battery voltage, 1 mV a step
-    return true;
+    bool ok = i2c_rd(s_axp, 0x00, &st, 1) == ESP_OK && (st & 0x08) &&   // status 1, bit 3: a battery is there
+              i2c_rd(s_axp, 0xA4, &p, 1) == ESP_OK;                      // fuel gauge, percent
+    if (ok && pct) *pct = p > 100 ? 100 : p;
+    if (ok && mv && i2c_rd(s_axp, 0x34, v, 2) == ESP_OK) *mv = ((v[0] & 0x3F) << 8) | v[1];   // battery voltage, 1 mV a step
+    i2c_give();
+    return ok;
 #else
     (void)pct; (void)mv;
+    return false;
+#endif
+}
+
+// ── C5 3.5: the LC76G GPS on the board's I2C bus (its header UART does not reach the chip). Waveshare's
+// LC76G_RPI_I2C protocol: commands are written to 0x50, answers read from 0x54, each with its own stop (no repeated
+// start), 0x58 is written only to wake the module. One read is: ask how much text waits, read that count, ask for
+// that many bytes, read them. The module stretches the clock while it gets an answer ready. ──
+#if CONFIG_IDF_TARGET_ESP32C5
+#define GPS_CR_ADDR 0x50
+#define GPS_RD_ADDR 0x54
+#define GPS_WR_ADDR 0x58
+// Between the steps of one read. Waveshare's own code waits 10 ms; a FreeRTOS delay of less than two ticks can be
+// no wait at all (bench 2026-11-21: with none, every read failed).
+#define GPS_STEP() vTaskDelay(pdMS_TO_TICKS(20))
+static i2c_master_dev_handle_t s_gps_cr, s_gps_rd, s_gps_wr;
+
+static i2c_master_dev_handle_t gps_dev(uint8_t addr) {
+    i2c_master_dev_handle_t d = NULL;
+    i2c_device_config_t dc = { .dev_addr_length = I2C_ADDR_BIT_LEN_7, .device_address = addr, .scl_speed_hz = WS35_I2C_HZ,
+                               .scl_wait_us = 100000 };
+    return i2c_master_bus_add_device(s_i2c, &dc, &d) == ESP_OK ? d : NULL;
+}
+static bool gps_cmd(uint32_t reg, uint32_t len) {
+    uint8_t b[8] = { (uint8_t)reg, (uint8_t)(reg >> 8), (uint8_t)(reg >> 16), (uint8_t)(reg >> 24),
+                     (uint8_t)len, (uint8_t)(len >> 8), (uint8_t)(len >> 16), (uint8_t)(len >> 24) };
+    return i2c_master_transmit(s_gps_cr, b, 8, 300) == ESP_OK;
+}
+static bool gps_len(uint32_t *out) {
+    uint8_t b[4];
+    if (i2c_master_receive(s_gps_rd, b, 4, 300) != ESP_OK) return false;
+    *out = b[0] | (b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+    return true;
+}
+#endif
+
+void lcd_i2c_scan(char *out, size_t cap) {
+    if (cap) out[0] = '\0';
+#if CONFIG_IDF_TARGET_ESP32C5
+    if (!s_i2c || s_panel != &WS35_C5 || !i2c_take(500)) return;
+    size_t len = 0;
+    for (uint16_t a = 0x08; a < 0x78 && len + 4 < cap; a++)
+        if (i2c_master_probe(s_i2c, a, 20) == ESP_OK) len += (size_t)snprintf(out + len, cap - len, " %02x", a);
+    i2c_give();
+#endif
+}
+
+bool lcd_gps_present(void) {
+#if CONFIG_IDF_TARGET_ESP32C5
+    if (!s_i2c || s_panel != &WS35_C5) return false;
+    if (s_gps_cr) return true;
+    if (!i2c_take(500)) return false;
+    // The module answers at its command address when awake; asleep, a touch at its other two wakes it.
+    bool here = false;
+    for (int i = 0; i < 4 && !here; i++) {
+        here = i2c_master_probe(s_i2c, GPS_CR_ADDR, 100) == ESP_OK;
+        if (!here) {
+            (void)i2c_master_probe(s_i2c, GPS_RD_ADDR, 100);
+            (void)i2c_master_probe(s_i2c, GPS_WR_ADDR, 100);
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+    if (here) {
+        s_gps_cr = gps_dev(GPS_CR_ADDR);
+        s_gps_rd = gps_dev(GPS_RD_ADDR);
+        s_gps_wr = gps_dev(GPS_WR_ADDR);
+        here = s_gps_cr && s_gps_rd && s_gps_wr;
+    }
+    i2c_give();
+    return here;
+#else
+    return false;
+#endif
+}
+
+int lcd_gps_read(uint8_t *buf, size_t cap) {
+#if CONFIG_IDF_TARGET_ESP32C5
+    if (!s_gps_cr || !i2c_take(200)) return -1;
+    int out = -1, step = 0;
+    uint8_t zero = 0;
+    uint32_t len = 0;
+    do {
+        GPS_STEP();
+        if (i2c_master_transmit(s_gps_cr, &zero, 1, 300) != ESP_OK) {   // no answer: a touch at its other addresses
+            (void)i2c_master_probe(s_i2c, GPS_RD_ADDR, 100);
+            (void)i2c_master_probe(s_i2c, GPS_WR_ADDR, 100);
+            break;
+        }
+        step = 1; GPS_STEP();
+        if (!gps_cmd(0xAA510008UL, 4)) break;          // how much text is waiting?
+        step = 2; GPS_STEP();
+        if (!gps_len(&len)) break;
+        step = 3;
+        if (len == 0) { out = 0; break; }
+        if (len >= 35 * 1024) break;                   // not a length the module gives
+        if (len > cap) len = cap;                      // the rest comes with the next read
+        GPS_STEP();
+        if (!gps_cmd(0xAA512000UL, len)) break;        // send that many
+        step = 4; GPS_STEP();
+        if (i2c_master_receive(s_gps_rd, buf, len, 500) != ESP_OK) break;
+        out = (int)len;
+    } while (0);
+    i2c_give();
+    static uint8_t said;
+    if (out < 0 && said < 6) { said++; ESP_LOGW(TAG, "gps read stopped at step %d (length %08lx)", step, (unsigned long)len); }
+    return out;
+#else
+    (void)buf; (void)cap;
+    return -1;
+#endif
+}
+
+bool lcd_gps_wake(void) {
+#if CONFIG_IDF_TARGET_ESP32C5
+    if (!s_gps_cr || !i2c_take(200)) return false;
+    bool ok = false;
+    uint8_t zero = 0;
+    uint32_t room = 0;
+    do {
+        GPS_STEP();
+        if (i2c_master_transmit(s_gps_cr, &zero, 1, 300) != ESP_OK) break;
+        GPS_STEP();
+        if (!gps_cmd(0xAA510004UL, 4)) break;          // room in its receive buffer
+        GPS_STEP();
+        if (!gps_len(&room) || room < 1) break;
+        GPS_STEP();
+        if (!gps_cmd(0xAA531000UL, 1)) break;          // one byte is coming
+        GPS_STEP();
+        ok = i2c_master_transmit(s_gps_wr, &zero, 1, 300) == ESP_OK;
+    } while (0);
+    i2c_give();
+    return ok;
+#else
     return false;
 #endif
 }
@@ -879,7 +1023,7 @@ static void backlight(int duty) {
     if (s_no_bl) return;
 #if CONFIG_IDF_TARGET_ESP32C5
     if (s_panel == &WS35_C5) {   // the C5 3.5: the expander's PWM register, not a GPIO
-        if (s_exio) i2c_wr(s_exio, EXIO_PWM, (uint8_t)duty);
+        if (s_exio && i2c_take(300)) { i2c_wr(s_exio, EXIO_PWM, (uint8_t)duty); i2c_give(); }
         return;
     }
 #endif

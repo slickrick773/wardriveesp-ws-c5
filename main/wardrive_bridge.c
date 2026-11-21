@@ -877,6 +877,7 @@ static void gps_where(sdrun_ap_t *r) {
 static bool board_pin_busy(int gpio);
 static bool board_is_awok(void);
 static bool board_gps14(void);
+static bool board_is_ws35c5(void);
 // AWOK Dual C5 (its screen chip), Marauder Mini v3 and Koko V8: the GPS module sits on GPIO 14. Marauder's MARAUDER_V8 and
 // MARAUDER_MINI_V3 builds open it with Serial2.begin(baud, 8N1, 14, 13) (GPS_TX 14, GPS_RX 13), and Arduino takes the
 // RX pin first. Marauder leaves the module at 115200; from power-up it's at 9600. GPIO 13/14 are the C5's native USB,
@@ -908,8 +909,69 @@ static bool gps_listen(uart_port_t port, int rx, int baud, uint32_t ms) {
     return false;
 }
 
+// One fix a second at most to the linked host (send_line no-ops when there's no link).
+static void gps_emit(uint32_t *last_emit) {
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    if (!s_gps_dirty || now - *last_emit < 1000) return;
+    s_gps_dirty = false; *last_emit = now;
+    char latb[20], lonb[20], altb[16];
+    fmt_fixed(latb, sizeof(latb), s_gps_lat, 1000000, 6);
+    fmt_fixed(lonb, sizeof(lonb), s_gps_lon, 1000000, 6);
+    if (s_gps_has_alt) {
+        fmt_fixed(altb, sizeof(altb), s_gps_alt, 10, 1);
+        send_line("WD:GPS ts=%lu lat=%s lon=%s alt=%s fix=1 sats=%d",
+                  (unsigned long)now, latb, lonb, altb, s_gps_sats);
+    } else {
+        send_line("WD:GPS ts=%lu lat=%s lon=%s fix=1 sats=%d",
+                  (unsigned long)now, latb, lonb, s_gps_sats);
+    }
+}
+
+#if CONFIG_IDF_TARGET_ESP32C5
+// Waveshare C5 3.5: its GPS is an LC76G read over the board's I2C bus (lcd_gps_read), twice a second. The same
+// sentences go to the same parser as a UART module's. The module is an add-on on the header's I2C pins (the header's
+// UART does not reach the chip), so a board without one is asked again every 5 s: plugged in later, it is found.
+static void gps_i2c_run(void) {
+    for (int tries = 0; !lcd_gps_present(); tries++) {
+        if (!tries) ESP_LOGI(TAG, "GPS: no LC76G answers on the board's I2C bus yet, asking every 5 s");
+        if (tries % 6 == 0) {   // what does answer, every 30 s: a module at another address shows here
+            char found[160];
+            lcd_i2c_scan(found, sizeof(found));
+            ESP_LOGI(TAG, "GPS: I2C bus has%s", found[0] ? found : " nothing");
+        }
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+    ESP_LOGI(TAG, "GPS: LC76G on the board's I2C bus");
+    static uint8_t buf[1024];
+    char line[128]; int li = 0;
+    uint32_t last_emit = 0, bytes = 0, fails = 0;
+    int empty = 0;
+    bool heard = false, fixed = false;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        int n = lcd_gps_read(buf, sizeof(buf));
+        if (n < 0) { if (++fails % 120 == 1) ESP_LOGW(TAG, "GPS: the LC76G didn't answer (%lu times)", (unsigned long)fails); continue; }
+        if (n == 0) { if (++empty >= 8) { empty = 0; lcd_gps_wake(); } continue; }
+        empty = 0;
+        bytes += (uint32_t)n;
+        for (int i = 0; i < n; i++) {
+            char c = (char)buf[i];
+            if (c == '\n' || c == '\r') { if (li > 0) { line[li] = '\0'; handle_nmea(line); li = 0; } }
+            else if (li < (int)sizeof(line) - 1) line[li++] = c;
+            else li = 0;
+        }
+        if (!heard && s_gps_talking) { heard = true; ESP_LOGI(TAG, "GPS: NMEA from the LC76G (%lu bytes so far)", (unsigned long)bytes); }
+        if (!fixed && s_gps_fix_ms) { fixed = true; ESP_LOGI(TAG, "GPS: first fix, %d satellites", s_gps_sats); }
+        gps_emit(&last_emit);
+    }
+}
+#endif
+
 static void gps_task(void *arg) {
     (void)arg;
+#if CONFIG_IDF_TARGET_ESP32C5
+    if (board_is_ws35c5()) gps_i2c_run();   // never returns
+#endif
     const uart_port_t port = CONFIG_WARDRIVEESP_GPS_UART_NUM;
     uart_config_t cfg = {
         .baud_rate = CONFIG_WARDRIVEESP_GPS_BAUD,
@@ -959,22 +1021,7 @@ static void gps_task(void *arg) {
             else if (li < (int)sizeof(line) - 1) line[li++] = c;
             else li = 0;                           // oversized/garbled line — drop it
         }
-        // Emit at most once a second, only while connected (send_line no-ops when there's no link).
-        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-        if (s_gps_dirty && now - last_emit >= 1000) {
-            s_gps_dirty = false; last_emit = now;
-            char latb[20], lonb[20], altb[16];
-            fmt_fixed(latb, sizeof(latb), s_gps_lat, 1000000, 6);
-            fmt_fixed(lonb, sizeof(lonb), s_gps_lon, 1000000, 6);
-            if (s_gps_has_alt) {
-                fmt_fixed(altb, sizeof(altb), s_gps_alt, 10, 1);
-                send_line("WD:GPS ts=%lu lat=%s lon=%s alt=%s fix=1 sats=%d",
-                          (unsigned long)now, latb, lonb, altb, s_gps_sats);
-            } else {
-                send_line("WD:GPS ts=%lu lat=%s lon=%s fix=1 sats=%d",
-                          (unsigned long)now, latb, lonb, s_gps_sats);
-            }
-        }
+        gps_emit(&last_emit);
     }
 }
 #endif  // CONFIG_WARDRIVEESP_GPS_ENABLE
@@ -2641,6 +2688,7 @@ static const board_def_t BOARDS[] = {
 };
 static board_t s_board = BOARD_NONE;
 static bool board_is_awok(void) { return s_board == BOARD_AWOK_DUAL_C5; }
+__attribute__((unused)) static bool board_is_ws35c5(void) { return s_board == BOARD_WS_C5_TOUCH35; }   // GPS on its I2C bus
 static bool board_gps14(void) {   // GPS on GPIO 14 (GhostESP / Marauder configs: GPS_UART_RX_PIN 14)
     return s_board == BOARD_AWOK_DUAL_C5 || s_board == BOARD_MINI_V3 || s_board == BOARD_KOKO_V8;
 }
