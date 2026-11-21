@@ -2609,7 +2609,7 @@ static const char *reset_reason_name(esp_reset_reason_t r) {
 typedef enum { BOARD_NONE = 0, BOARD_CRUMB, BOARD_GHOSTBOARD, BOARD_POLTERGEIST,
                BOARD_BISCUIT_PRO, BOARD_BISCUIT_ULTRA, BOARD_BISCUIT_DUAL, BOARD_KOKO_V8,
                BOARD_MINI_V3, BOARD_AWOK_DUAL_C5, BOARD_WS_C6_LCD147,
-               BOARD_WS_C5_LCD147, BOARD_WS_S3_TOUCH35 } board_t;
+               BOARD_WS_C5_LCD147, BOARD_WS_S3_TOUCH35, BOARD_WS_C5_TOUCH35 } board_t;
 typedef struct { const char *id, *name; int led_gpio, pixels; } board_def_t;
 static const board_def_t BOARDS[] = {
     [BOARD_NONE]          = { NULL, "generic", -1, 0 },
@@ -2635,6 +2635,9 @@ static const board_def_t BOARDS[] = {
     [BOARD_WS_C5_LCD147]  = { "waveshare_c5_lcd147", "Waveshare ESP32-C5-LCD-1.47", 8, 1 },
     // ESP32-S3: told apart by its I2C chips (touch, AXP2101, TCA9554; lcd_probe_ws35). 320x480 touch screen, no LED.
     [BOARD_WS_S3_TOUCH35] = { "waveshare_s3_touch_lcd35", "Waveshare ESP32-S3-Touch-LCD-3.5", -1, 0 },
+    // ESP32-C5: told apart by its I2C chips on 27/26 (I/O expander at 0x24, AXP2101; lcd_probe_ws35). The same
+    // 320x480 touch screen as the S3 board, a microSD slot on the screen's bus, no LED.
+    [BOARD_WS_C5_TOUCH35] = { "waveshare_c5_touch_lcd35", "Waveshare ESP32-C5-Touch-LCD-3.5", -1, 0 },
 };
 static board_t s_board = BOARD_NONE;
 static bool board_is_awok(void) { return s_board == BOARD_AWOK_DUAL_C5; }
@@ -2992,6 +2995,15 @@ static bool gauge_read(uint8_t reg, uint16_t *out) {
 
 static void battery_read(void) {
     uint16_t soc, vcell;
+    if (s_board == BOARD_WS_C5_TOUCH35) {   // the C5 3.5's AXP2101: a LiPo may be connected, or plugged in later
+        int pct = -1, mv = 0;
+        bool had = s_has_batt;
+        s_has_batt = lcd_battery(&pct, &mv);
+        if (s_has_batt) { s_batt_pct = pct; s_batt_mv = mv; }
+        else s_batt_pct = -1;
+        if (s_has_batt != had) send_caps_line();
+        return;
+    }
     if (!s_gauge_i2c) return;
     if (gauge_read(0x04, &soc)) s_batt_pct = (soc >> 8) > 100 ? 100 : (soc >> 8);   // whole percent in the high byte
     if (gauge_read(0x02, &vcell)) s_batt_mv = (int)((uint32_t)vcell * 5 / 64);       // 78.125 µV per bit
@@ -3093,6 +3105,10 @@ static bool board_pin_busy(int gpio) {
         static const int8_t WS35[] = { 1, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 21, 38, 39, 40, 41, 42, 45, 46, 47, 48 };
         for (size_t i = 0; i < sizeof(WS35); i++) if (WS35[i] == gpio) return true;
     }
+    if (s_board == BOARD_WS_C5_TOUCH35) {   // screen + microSD bus, I2C, audio, camera, BOOT button
+        static const int8_t WS35C5[] = { 0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 23, 24, 25, 26, 27, 28 };
+        for (size_t i = 0; i < sizeof(WS35C5); i++) if (WS35C5[i] == gpio) return true;
+    }
     return gpio < 0;
 }
 
@@ -3176,6 +3192,7 @@ static bool stored_board_is(const char *id) {
 static const board_t PICKABLE[] = {
 #if CONFIG_IDF_TARGET_ESP32C5
     BOARD_KOKO_V8, BOARD_MINI_V3, BOARD_AWOK_DUAL_C5, BOARD_WS_C5_LCD147, BOARD_CRUMB, BOARD_POLTERGEIST,
+    BOARD_WS_C5_TOUCH35,
 #elif CONFIG_IDF_TARGET_ESP32C6
     BOARD_GHOSTBOARD, BOARD_WS_C6_LCD147,
 #elif CONFIG_IDF_TARGET_ESP32S3
@@ -3239,13 +3256,17 @@ static bool ghost_cs_pulled_up(void) {
 }
 #endif
 
-#if CONFIG_IDF_TARGET_ESP32S3
-static bool s_has_ws35;   // the S3 3.5's touch, power and expander chips answered on I2C 8/7
+#if CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32C5
+// The S3 3.5's touch, power and expander chips answered on I2C 8/7; on a C5, the C5 3.5's expander and power chip on 27/26
+static bool s_has_ws35;
 #endif
 
 static board_t board_detect(void) {
 #if CONFIG_IDF_TARGET_ESP32S3
     if (s_has_ws35) return BOARD_WS_S3_TOUCH35;
+#endif
+#if CONFIG_IDF_TARGET_ESP32C5
+    if (s_has_ws35) return BOARD_WS_C5_TOUCH35;
 #endif
 #if CONFIG_IDF_TARGET_ESP32C6
     if (s_is_ghost) return BOARD_GHOSTBOARD;
@@ -3442,6 +3463,7 @@ static void board_init(void) {
         else if (picked == BOARD_MINI_V3) s_has_mini = lcd_probe_mini(true);
         else if (picked == BOARD_WS_C5_LCD147) s_has_ws5 = lcd_probe_waveshare(true);
         else if (picked == BOARD_POLTERGEIST) s_has_disp = display_probe(POLT_SDA, POLT_SCL);
+        else if (picked == BOARD_WS_C5_TOUCH35) s_has_ws35 = lcd_probe_ws35();
 #endif
 #if CONFIG_IDF_TARGET_ESP32C6
         if (picked == BOARD_GHOSTBOARD) s_is_ghost = true;
@@ -3452,6 +3474,10 @@ static void board_init(void) {
 #endif
     } else {
 #if CONFIG_IDF_TARGET_ESP32C5
+    // The Waveshare C5 3.5 first, by its I2C chips on 27/26: the other probes below open buses on pins its screen,
+    // card slot and I2C use (2/6/7, 0/1, 26), so none of them runs on it.
+    s_has_ws35 = !s_gauge_i2c && lcd_probe_ws35();
+    if (!s_has_ws35) {
     s_has_disp = !s_gauge_i2c && display_probe(POLT_SDA, POLT_SCL);
     s_has_lcd = s_gauge_i2c && lcd_probe_koko(false);
     s_has_mini = !s_gauge_i2c && !s_has_disp && lcd_probe_mini(stored_board_is("marauder_mini_v3"));
@@ -3460,8 +3486,9 @@ static void board_init(void) {
     // Nothing else claimed the board: the Waveshare C5 1.47 (its own pin signature, see lcd_probe_waveshare).
     if (!s_gauge_i2c && !s_has_disp && !s_has_mini && !s_has_lcd)
         s_has_ws5 = lcd_probe_waveshare(stored_board_is("waveshare_c5_lcd147"));
+    }
 #if CONFIG_WARDRIVEESP_BENCH_TOOLS
-    if (!s_has_disp) i2c_pair_scan(0, 1);
+    if (!s_has_disp && !s_has_ws35) i2c_pair_scan(0, 1);
 #endif
 #endif
 #if CONFIG_IDF_TARGET_ESP32C6
@@ -3506,6 +3533,20 @@ static void board_init(void) {
     if (s_board == BOARD_WS_C5_LCD147) lcd_start(b->name, FW_VERSION, lcd_fill);
     if (s_board == BOARD_KOKO_V8 || s_board == BOARD_MINI_V3 || s_board == BOARD_AWOK_DUAL_C5) {
         lcd_start(b->name, FW_VERSION, lcd_fill);
+        sdrun_init(b->id, b->name, FW_VERSION);   // the card mounts in the background (the slot on the screen's bus)
+        nvs_handle_t h;   // no ring to load it: the screen takes the saved stealth setting itself
+        uint8_t v;
+        if (nvs_open("iosesp", NVS_READONLY, &h) == ESP_OK) {
+            if (nvs_get_u8(h, "ledstealth", &v) == ESP_OK) { s_led_stealth = v != 0; lcd_set_stealth(s_led_stealth); }
+            nvs_close(h);
+        }
+    }
+#endif
+#if CONFIG_IDF_TARGET_ESP32C5
+    if (s_board == BOARD_WS_C5_TOUCH35) {
+        battery_read();   // a LiPo on its AXP2101, if one is connected
+        lcd_start(b->name, FW_VERSION, lcd_fill);
+        lcd_set_touch_handler(on_touch);
         sdrun_init(b->id, b->name, FW_VERSION);   // the card mounts in the background (the slot on the screen's bus)
         nvs_handle_t h;   // no ring to load it: the screen takes the saved stealth setting itself
         uint8_t v;
@@ -5060,7 +5101,7 @@ static void ext_build(void) {
 #endif
     bool screen = s_board == BOARD_KOKO_V8 || s_board == BOARD_MINI_V3 || s_board == BOARD_AWOK_DUAL_C5 ||
                   s_board == BOARD_POLTERGEIST || s_board == BOARD_WS_C6_LCD147 || s_board == BOARD_WS_C5_LCD147 ||
-                  s_board == BOARD_WS_S3_TOUCH35;
+                  s_board == BOARD_WS_S3_TOUCH35 || s_board == BOARD_WS_C5_TOUCH35;
     uint8_t *b = s_ext + 2;
     memset(b, 0, 6);
     s_ext[0] = EXT_UUID16 & 0xFF; s_ext[1] = EXT_UUID16 >> 8;
@@ -5430,7 +5471,7 @@ static void health_task(void *arg) {
         heap_check("health 1 s");
         s_heap_min_seen = esp_get_minimum_free_heap_size();
         uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-        if ((s_has_batt || s_board == BOARD_WS_S3_TOUCH35) && now - last_batt >= 30000) { last_batt = now; battery_read(); }   // the I2C gauge only (the S3 3.5: a battery can be plugged in later)
+        if ((s_has_batt || s_board == BOARD_WS_S3_TOUCH35 || s_board == BOARD_WS_C5_TOUCH35) && now - last_batt >= 30000) { last_batt = now; battery_read(); }   // the I2C gauge only (the S3 3.5: a battery can be plugged in later)
 #if COPROC
         coproc_tick(now);
 #endif

@@ -52,8 +52,10 @@ bool lcd_probe_waveshare(bool stored);
 /// Waveshare ESP32-S3-Touch-LCD-3.5 check (ESP32-S3): only when its I2C bus (SDA 8 / SCL 7) reads pulled up, and only
 /// when the FT6336 touch chip, the AXP2101 power chip and the TCA9554 expander all answer with their own IDs. Never
 /// touches a screen pin unless they do. Keeps the I2C bus (touch, battery) and the panel when it is one.
+/// On an ESP32-C5 the same call checks for the Waveshare ESP32-C5-Touch-LCD-3.5: only when its I2C bus (SDA 27 /
+/// SCL 26) reads pulled up, and only when its I/O expander (0x24) answers and the AXP2101 gives its own ID.
 bool lcd_probe_ws35(void);
-/// The S3 3.5's battery through its AXP2101: false when no battery is connected (or on any other board).
+/// The 3.5-inch boards' battery through their AXP2101: false when no battery is connected (or on any other board).
 bool lcd_battery(int *pct, int *mv);
 /// What a touch on the screen asks for (touch boards only); the firmware acts on it so the LED and the saved
 /// settings follow too.

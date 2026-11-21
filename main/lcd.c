@@ -1,5 +1,6 @@
 // WardriveESP — color status screens over SPI: the Koko Marauder V8's 240x320 ILI9341, the Marauder Mini v3's
-// 128x128 ST7735 and the Waveshare ESP32-C6-LCD-1.47's 172x320 ST7789. Boot splash, live dashboard, alerts (scenes in lcd_draw.c). Drawn in 16-row strips into one small DMA
+// 128x128 ST7735, the Waveshare ESP32-C6-LCD-1.47's 172x320 ST7789 and the 320x480 ST7796 of the Waveshare 3.5-inch
+// touch boards (ESP32-S3-Touch-LCD-3.5, ESP32-C5-Touch-LCD-3.5). Boot splash, live dashboard, alerts (scenes in lcd_draw.c). Drawn in 16-row strips into one small DMA
 // buffer; a strip goes to the panel only when its pixels changed.
 // SPDX-License-Identifier: MIT
 
@@ -19,8 +20,10 @@
 #include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "esp_efuse.h"
-#if CONFIG_IDF_TARGET_ESP32S3
+#if CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32C5
 #include "driver/i2c_master.h"
+#endif
+#if CONFIG_IDF_TARGET_ESP32S3
 #include "esp_lcd_panel_io.h"
 #endif
 #include "lcd.h"
@@ -36,6 +39,9 @@ static const pins_t PINS_C5 = { 2, 7, 6, 23, 24, -1, 9, 10 };
 __attribute__((unused)) static const pins_t PINS_WS147 = { 5, 6, 7, 14, 15, 21, -1, 4 };
 // Waveshare ESP32-C5-LCD-1.47: the same board on the C5, panel CS 23 / DC 24 / reset 26 (backlight on 10).
 __attribute__((unused)) static const pins_t PINS_WS147_C5 = { 5, 6, 7, 23, 24, 26, -1, 4 };
+// Waveshare ESP32-C5-Touch-LCD-3.5: panel and microSD share MISO 2 / MOSI 7 / SCLK 6; panel CS 8 / DC 5, card CS 9.
+// The panel's reset and the backlight are not GPIOs: both sit on the board's I/O expander (I2C).
+__attribute__((unused)) static const pins_t PINS_WS35_C5 = { 2, 7, 6, 8, 5, -1, -1, 9 };
 static const pins_t *s_pins = &PINS_C5;
 #define PIN_MISO     (s_pins->miso)
 #define PIN_MOSI     (s_pins->mosi)
@@ -151,7 +157,7 @@ __attribute__((unused)) static const init_t INIT_ST7796[] = {
 typedef struct {
     const char *name, *size;
     int w, h, xofs, yofs;                 // panel size and where it sits in the controller's memory
-    int bl;                               // backlight GPIO
+    int bl;                               // backlight GPIO (-1: not a GPIO, see backlight())
     bool bl_low;                          // backlight on when the pin is low
     int hz;                               // write clock
     const init_t *init;
@@ -168,6 +174,10 @@ __attribute__((unused)) static const panel_t WS35 = { "320x480 ST7796", "320x480
                               INIT_ST7796, sizeof(INIT_ST7796) / sizeof(INIT_ST7796[0]) };
 __attribute__((unused)) static const panel_t WS147_C5 = { "172x320 ST7789", "172x320", 172, 320, 34, 0, 10, false, 40000000,
                               INIT_ST7789, sizeof(INIT_ST7789) / sizeof(INIT_ST7789[0]) };
+
+// The same glass on the Waveshare ESP32-C5-Touch-LCD-3.5: backlight through the I/O expander's PWM register.
+__attribute__((unused)) static const panel_t WS35_C5 = { "320x480 ST7796", "320x480", 320, 480, 0, 0, -1, false, 40000000,
+                              INIT_ST7796, sizeof(INIT_ST7796) / sizeof(INIT_ST7796[0]) };
 
 static const panel_t *s_panel;
 /// Either Waveshare 1.47 (C6 or C5): its card slot stays unused.
@@ -277,13 +287,8 @@ __attribute__((unused)) static bool pulled_up(int gpio) {
     return high >= 4;
 }
 
-// Only when one of the bus's chip selects already reads pulled up: never drive these pins on a board without them.
-// Opens the bus and holds every pulled-up select other than the panel's at its resting (deselected) level.
-__attribute__((unused)) static bool bus_open(const char *who, bool touch_too) {
-    bool cs = pulled_up(PIN_CS), tcs = touch_too && pulled_up(PIN_TOUCH_CS), sdcs = pulled_up(PIN_SD_CS);
-    ESP_LOGI(TAG, "%s probe: pulled up CS %d=%d, touch CS %d=%d, SD CS %d=%d", who, PIN_CS, cs, PIN_TOUCH_CS, tcs,
-             PIN_SD_CS, sdcs);
-    if (!cs && !tcs && !sdcs) return false;
+// Opens the bus and holds the touch and microSD selects named here at their resting (deselected) level.
+__attribute__((unused)) static bool bus_start(bool tcs, bool sdcs) {
     if (tcs) { gpio_set_direction(PIN_TOUCH_CS, GPIO_MODE_OUTPUT); gpio_set_level(PIN_TOUCH_CS, 1); }
     if (sdcs) { gpio_set_direction(PIN_SD_CS, GPIO_MODE_OUTPUT); gpio_set_level(PIN_SD_CS, 1); }
     s_sd_cs = sdcs;
@@ -305,6 +310,16 @@ __attribute__((unused)) static bool bus_open(const char *who, bool touch_too) {
     gpio_set_direction(PIN_DC, GPIO_MODE_OUTPUT);
     gpio_set_level(PIN_DC, 1);
     return true;
+}
+
+// Only when one of the bus's chip selects already reads pulled up: never drive these pins on a board without them.
+// Opens the bus and holds every pulled-up select other than the panel's at its resting (deselected) level.
+__attribute__((unused)) static bool bus_open(const char *who, bool touch_too) {
+    bool cs = pulled_up(PIN_CS), tcs = touch_too && pulled_up(PIN_TOUCH_CS), sdcs = pulled_up(PIN_SD_CS);
+    ESP_LOGI(TAG, "%s probe: pulled up CS %d=%d, touch CS %d=%d, SD CS %d=%d", who, PIN_CS, cs, PIN_TOUCH_CS, tcs,
+             PIN_SD_CS, sdcs);
+    if (!cs && !tcs && !sdcs) return false;
+    return bus_start(tcs, sdcs);
 }
 
 __attribute__((unused)) static bool is_ili9341(const uint8_t *id) { return id[1] == 0x93 && id[2] == 0x41; }
@@ -470,18 +485,39 @@ bool lcd_probe_waveshare(bool stored) {
 #endif
 }
 
-// ── Waveshare ESP32-S3-Touch-LCD-3.5: I2C fingerprint, the panel through esp_lcd, touch and battery ──
+// ── Waveshare 3.5-inch touch boards: I2C fingerprint, touch and battery. ESP32-S3-Touch-LCD-3.5: the panel through
+// esp_lcd. ESP32-C5-Touch-LCD-3.5: the panel on the plain SPI path, sharing its bus with the microSD slot. ──
+#if CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32C5
 #if CONFIG_IDF_TARGET_ESP32S3
 #define WS35_SDA 8
 #define WS35_SCL 7
 #define WS35_MOSI 1
 #define WS35_SCLK 5
 #define WS35_DC 3
+#define WS35_I2C_HZ 400000
+#define TCA9554_ADDR 0x20
+#else
+#define WS35_SDA 27
+#define WS35_SCL 26
+#define WS35_I2C_HZ 100000   // the bus runs over the panel flex: 100 kHz
+// The C5 board's I/O expander (a CH32V006 with Waveshare's firmware): panel reset, touch reset, speaker amplifier
+// enable and the backlight's PWM. One byte a register.
+#define EXIO_ADDR    0x24
+#define EXIO_MODE    0x02    // a bit set = that line is an output
+#define EXIO_OUT     0x03
+#define EXIO_PWM     0x05    // backlight, 0-255
+#define EXIO_TP_RST  0x01    // line 0: touch reset, active low
+#define EXIO_LCD_RST 0x02    // line 1: panel reset, active low
+#define EXIO_AMP_EN  0x20    // line 5: speaker amplifier enable (not a power rail: the panel runs with it low)
+#endif
 #define FT6336_ADDR  0x38
 #define AXP2101_ADDR 0x34
-#define TCA9554_ADDR 0x20
 static i2c_master_bus_handle_t s_i2c;
+#if CONFIG_IDF_TARGET_ESP32S3
 static i2c_master_dev_handle_t s_ft, s_axp, s_tca;
+#else
+static i2c_master_dev_handle_t s_ft, s_axp, s_exio;
+#endif
 
 static esp_err_t i2c_rd(i2c_master_dev_handle_t d, uint8_t reg, uint8_t *out, size_t n) {
     return i2c_master_transmit_receive(d, &reg, 1, out, n, 30);
@@ -492,7 +528,7 @@ static esp_err_t i2c_wr(i2c_master_dev_handle_t d, uint8_t reg, uint8_t v) {
 }
 static i2c_master_dev_handle_t i2c_dev(uint8_t addr) {
     i2c_master_dev_handle_t d = NULL;
-    i2c_device_config_t dc = { .dev_addr_length = I2C_ADDR_BIT_LEN_7, .device_address = addr, .scl_speed_hz = 400000 };
+    i2c_device_config_t dc = { .dev_addr_length = I2C_ADDR_BIT_LEN_7, .device_address = addr, .scl_speed_hz = WS35_I2C_HZ };
     return i2c_master_bus_add_device(s_i2c, &dc, &d) == ESP_OK ? d : NULL;
 }
 // Both lines read high against the internal pull-downs: the bus's own pull-ups. Nothing is clocked on a board without.
@@ -549,8 +585,90 @@ static void touch_task(void *arg) {
 }
 #endif
 
+#if CONFIG_IDF_TARGET_ESP32C5
+static void ws35_i2c_close(void) {
+    if (s_ft) i2c_master_bus_rm_device(s_ft);
+    if (s_axp) i2c_master_bus_rm_device(s_axp);
+    if (s_exio) i2c_master_bus_rm_device(s_exio);
+    s_ft = s_axp = s_exio = NULL;
+    i2c_del_master_bus(s_i2c);
+    s_i2c = NULL;
+    gpio_reset_pin(WS35_SDA);
+    gpio_reset_pin(WS35_SCL);
+}
+
+// The C5 3.5's expander, from whatever state it is in (it keeps its state across a chip reset): backlight off, the
+// three lines it drives made outputs, then one reset pulse for the panel and one for the touch chip. Order and
+// timings are the ESP32-C5-BSP's bring-up for this board, which was run on hardware there.
+#define EXIO_CTRL (EXIO_TP_RST | EXIO_LCD_RST | EXIO_AMP_EN)
+static bool exio_up(void) {
+    static const struct { uint8_t reg, v; uint16_t ms; } SEQ[] = {
+        { EXIO_PWM, 0, 0 }, { EXIO_MODE, 0xFF, 0 }, { EXIO_OUT, 0, 0 }, { EXIO_PWM, 0, 0 }, { EXIO_MODE, EXIO_CTRL, 0 },
+        { EXIO_OUT, EXIO_TP_RST | EXIO_LCD_RST, 50 }, { EXIO_OUT, 0, 50 }, { EXIO_OUT, EXIO_CTRL, 50 },
+        { EXIO_OUT, EXIO_CTRL & ~EXIO_LCD_RST, 20 }, { EXIO_OUT, EXIO_CTRL, 120 },   // panel reset
+        { EXIO_OUT, EXIO_CTRL & ~EXIO_TP_RST, 20 },  { EXIO_OUT, EXIO_CTRL, 300 },   // touch reset, then its start-up
+        { EXIO_OUT, EXIO_CTRL & ~EXIO_AMP_EN, 0 },   // speaker amplifier off: nothing here plays sound
+    };
+    for (size_t i = 0; i < sizeof(SEQ) / sizeof(SEQ[0]); i++) {
+        if (i2c_wr(s_exio, SEQ[i].reg, SEQ[i].v) != ESP_OK) return false;
+        if (SEQ[i].ms) vTaskDelay(pdMS_TO_TICKS(SEQ[i].ms));
+    }
+    return true;
+}
+#endif
+
 bool lcd_probe_ws35(void) {
-#if !CONFIG_IDF_TARGET_ESP32S3
+#if CONFIG_IDF_TARGET_ESP32C5
+    // Waveshare ESP32-C5-Touch-LCD-3.5. Only when its I2C bus (SDA 27 / SCL 26) reads pulled up, and only when the
+    // I/O expander answers at 0x24 and the AXP2101 power chip gives its own ID: nothing is written before both do.
+    if (s_bus) return s_panel == &WS35_C5;
+    if (!ws35_i2c_pulled_up()) {
+        snprintf(s_probe_note, sizeof(s_probe_note), "ws35: I2C %d/%d not pulled up", WS35_SDA, WS35_SCL);
+        ESP_LOGI(TAG, "ws35 probe: I2C on SDA %d / SCL %d not pulled up, not probed", WS35_SDA, WS35_SCL);
+        return false;
+    }
+    i2c_master_bus_config_t bc = { .i2c_port = -1, .sda_io_num = WS35_SDA, .scl_io_num = WS35_SCL,
+                                   .clk_source = I2C_CLK_SRC_DEFAULT, .glitch_ignore_cnt = 7 };
+    if (i2c_new_master_bus(&bc, &s_i2c) != ESP_OK) return false;
+    uint8_t ft = 0, axp = 0;
+    bool has_exio = i2c_master_probe(s_i2c, EXIO_ADDR, 30) == ESP_OK, has_axp = i2c_master_probe(s_i2c, AXP2101_ADDR, 30) == ESP_OK;
+    if (has_axp) { s_axp = i2c_dev(AXP2101_ADDR); if (!s_axp || i2c_rd(s_axp, 0x03, &axp, 1) != ESP_OK) axp = 0; }
+    if (has_exio) s_exio = i2c_dev(EXIO_ADDR);
+    bool ok = s_exio && axp == 0x4A;   // AXP2101 chip id
+    // The touch chip is held in reset by the expander until exio_up(), so it is read after it (FT6336U 0x64, FT6236
+    // 0x36). A touch chip that stays silent costs the pages and gestures, not the screen.
+    if (ok) ok = exio_up();
+    if (ok && i2c_master_probe(s_i2c, FT6336_ADDR, 30) == ESP_OK) {
+        s_ft = i2c_dev(FT6336_ADDR);
+        if (!s_ft || i2c_rd(s_ft, 0xA3, &ft, 1) != ESP_OK) ft = 0;
+        if (ft != 0x64 && ft != 0x36 && s_ft) { i2c_master_bus_rm_device(s_ft); s_ft = NULL; }
+    }
+    snprintf(s_probe_note, sizeof(s_probe_note), "ws35 c5 i2c: expander %s  axp2101 %02x  ft6336 %02x -> %s",
+             has_exio ? "yes" : "no", axp, ft, ok ? "match" : "none");
+    ESP_LOGI(TAG, "%s", s_probe_note);
+    if (!ok) { ws35_i2c_close(); return false; }
+
+    // The board is known: its panel select and the card's are driven without the pulled-up gate.
+    s_pins = &PINS_WS35_C5;
+    if (!bus_start(false, true)) { ws35_i2c_close(); s_pins = &PINS_C5; return false; }
+    uint8_t id[4] = {0};
+    if (add_device(CLK_READ_HZ, false) == ESP_OK) read_reg(0xD3, id, 4, false);   // ST7796 ID4: dummy, 00, 77, 96
+    ESP_LOGI(TAG, "ws35 probe: panel ID4 %02x %02x %02x %02x", id[0], id[1], id[2], id[3]);
+    {
+        size_t k = strlen(s_probe_note);
+        snprintf(s_probe_note + k, sizeof(s_probe_note) - k, "  id4 %02x%02x%02x%02x", id[0], id[1], id[2], id[3]);
+    }
+    if (add_device(WS35_C5.hz, false) != ESP_OK && add_device(CLK_WRITE_HZ, false) != ESP_OK) {
+        bus_release();
+        ws35_i2c_close();
+        s_pins = &PINS_C5;
+        return false;
+    }
+    s_panel = &WS35_C5;
+    s_touch_ok = s_ft != NULL;
+    if (s_touch_ok) xTaskCreate(touch_task, "wd_touch", 2560, NULL, 2, NULL);
+    return true;
+#elif !CONFIG_IDF_TARGET_ESP32S3
     return false;
 #else
     if (s_io) return s_panel == &WS35;
@@ -613,7 +731,7 @@ bool lcd_probe_ws35(void) {
 }
 
 bool lcd_battery(int *pct, int *mv) {
-#if CONFIG_IDF_TARGET_ESP32S3
+#if CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32C5
     if (!s_axp) return false;
     uint8_t st = 0, p = 0, v[2] = {0};
     if (i2c_rd(s_axp, 0x00, &st, 1) != ESP_OK || !(st & 0x08)) return false;   // status 1, bit 3: a battery is there
@@ -731,6 +849,12 @@ void lcd_set_mini_pin5(int mode) { s_pin5 = mode; }
 
 static void backlight(int duty) {
     if (s_no_bl) return;
+#if CONFIG_IDF_TARGET_ESP32C5
+    if (s_panel == &WS35_C5) {   // the C5 3.5: the expander's PWM register, not a GPIO
+        if (s_exio) i2c_wr(s_exio, EXIO_PWM, (uint8_t)duty);
+        return;
+    }
+#endif
     ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, (uint32_t)duty);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
 }
@@ -796,7 +920,7 @@ void lcd_start(const char *board, const char *version, lcd_fill_fn fill_fn) {
         gpio_set_level(s_panel->bl, 0); esp_rom_delay_us(10000);
         gpio_set_level(s_panel->bl, 1); vTaskDelay(pdMS_TO_TICKS(120));
         ESP_LOGI(TAG, "lcd: Mini pin 5 as reset");
-    } else {
+    } else if (s_panel->bl >= 0) {
         ledc_timer_config_t tc = { .speed_mode = LEDC_LOW_SPEED_MODE, .duty_resolution = LEDC_TIMER_8_BIT,
                                    .timer_num = LEDC_TIMER_1, .freq_hz = 5000, .clk_cfg = LEDC_AUTO_CLK };
         bool invert = s_panel->bl_low && !(s_panel == &MINI && s_pin5 == 2);
@@ -817,6 +941,9 @@ void lcd_start(const char *board, const char *version, lcd_fill_fn fill_fn) {
     render(&f, false);   // the splash is on the panel before it lights up (the bus is already held)
     cmd(0x29, NULL, 0);
     lcd_bus_unlock();
+    // The C5 3.5's glass shows a frame a little after its memory takes it: lit at once, the last picture or noise
+    // shows for a few frames (ESP32-C5-BSP, measured from video).
+    if (s_panel->bl < 0) vTaskDelay(pdMS_TO_TICKS(150));
     backlight(BL_ON);
     if (xTaskCreate(lcd_task, "wd_lcd", 4096, NULL, 1, &s_task) != pdPASS) { s_task = NULL; return; }
     ESP_LOGI(TAG, "lcd: %s running", s_panel->name);
