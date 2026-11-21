@@ -1,0 +1,2 @@
+# ESP32-S3 builds: full CPU speed (the S3 3.5's 320x480 screen draws 1.5x faster; every S3 runs this image)
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
