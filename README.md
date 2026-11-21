@@ -1,11 +1,12 @@
 # WardriveESP
 
 > **This copy adds the Waveshare ESP32-C5-Touch-LCD-3.5.** It is RocketGod's WardriveESP 1.7.11 with one more board:
-> the 320x480 touch screen, the microSD slot and the battery reading. Branch `main` is the unmodified upstream source;
-> `ws-c5-35` is the port.
+> the 320x480 touch screen, the microSD slot, the battery reading and a GPS (an LC76G module on the header's I2C
+> pins). Branch `main` is the unmodified upstream source; `ws-c5-35` is the port.
 >
-> Run on one board: screen, touch, battery reading, card mount, and the link to Wardrive Go on iPhone, alerts included.
-> Not there yet: saving a run to the card (the board's GPS is not read yet). Build with ESP-IDF `release/v5.5`.
+> Run on one board: screen, touch, battery reading, card mount, GPS fix, a run saved to the card with no app linked,
+> and the link to Wardrive Go on iPhone, alerts included. Known: free memory runs low while Bluetooth starts, and a
+> saved run can miss some rows. Build with ESP-IDF `release/v5.5`.
 
 ESP32 firmware that turns a small board into a Wi-Fi and Bluetooth scanner for the Wardrive Go app on iOS and
 Android. The board links to the app over Bluetooth and streams everything it hears. No pairing, no setup.
