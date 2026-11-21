@@ -1170,6 +1170,16 @@ static void wifi_start(void) {
     if (s_streaming || s_scan_task || s_ota_active || !scan_wanted()) return;
     s_streaming = true;
     if (xTaskCreate(scan_task, "wd_scan", 10240, NULL, 5, &s_scan_task) != pdPASS) {
+#if CONFIG_IDF_TARGET_ARCH_RISCV
+        // The same way out as the capture task's (cap_start): a board whose free memory is in pieces smaller than
+        // 10 KB still has one of 7. Bench 2026-11-21, Waveshare C5 3.5: 42 to 46 KB free with a largest piece of 7.9
+        // to 8.2 KB while a phone was linked, and the scan could not start for seconds at a time. The scan task was
+        // seen using 5.3 KB of its stack on that board, so 7 KB leaves under 2 KB spare.
+        if (xTaskCreate(scan_task, "wd_scan", 7168, NULL, 5, &s_scan_task) == pdPASS) {
+            ESP_LOGW(TAG, "stream started on a 7 KB stack (low memory)");
+            return;
+        }
+#endif
         s_streaming = false;
         s_scan_task = NULL;
         ESP_LOGE(TAG, "scan task create failed");
